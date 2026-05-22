@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+data/holodeck.db
+data/sessions/*
+data/cache/*
+!data/sessions/.gitkeep
+!data/cache/.gitkeep
+.DS_Store
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+node_modules/
