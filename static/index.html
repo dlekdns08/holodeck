@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Holodeck</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Holodeck</h1>
+    <span id="status" class="status">—</span>
+  </header>
+
+  <main>
+    <section class="stage">
+      <video id="player" controls autoplay muted playsinline></video>
+      <div id="narration" class="narration"></div>
+      <div id="loading" class="loading hidden">generating next beat…</div>
+    </section>
+
+    <section class="controls">
+      <div class="row">
+        <input id="genre" placeholder="genre (noir, kid-friendly fantasy, …)" />
+        <input id="opening" placeholder="opening situation" />
+        <button id="newBtn">New story</button>
+      </div>
+      <div class="row">
+        <input id="input" placeholder="what happens next?" autocomplete="off" />
+        <button id="turnBtn" disabled>Next beat</button>
+      </div>
+      <details>
+        <summary>World state</summary>
+        <pre id="state"></pre>
+      </details>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
