@@ -1,16 +1,24 @@
 from __future__ import annotations
 
-import json
 import logging
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from ..config import settings
 from ..world.state import Beat, Character, WorldState
-from .prompts import DIRECTOR_SYSTEM, USER_TURN_TEMPLATE
+from .prompts import (
+    EMIT_BEAT_TOOL,
+    SYNOPSIS_SYSTEM,
+    SYNOPSIS_USER_TEMPLATE,
+    USER_TURN_TEMPLATE,
+    build_system_prompt,
+)
 
 log = logging.getLogger(__name__)
+
+# Update the rolling synopsis once we've accumulated this many beats past the last one.
+SYNOPSIS_EVERY = 6
 
 
 class StateDelta(BaseModel):
@@ -34,8 +42,8 @@ class DirectorOutput(BaseModel):
 class Director:
     """Wraps Claude to plan the next beat from world state + user input.
 
-    Falls back to a deterministic stub if no API key is configured, so the loop
-    still runs end-to-end during local dev.
+    Uses Anthropic tool_use so the response is already a parsed object — no JSON
+    wrangling. Falls back to a deterministic stub when no API key is configured.
     """
 
     def __init__(self) -> None:
@@ -48,26 +56,59 @@ class Director:
             except ImportError:
                 log.warning("anthropic package missing — using stub Director")
 
+    @property
+    def using_stub(self) -> bool:
+        return self._client is None
+
     def plan(self, state: WorldState, user_input: str) -> DirectorOutput:
         if self._client is None:
             return self._stub(state, user_input)
 
-        recent = self._format_recent(state)
         user_msg = USER_TURN_TEMPLATE.format(
             world_summary=state.summary(),
-            recent_beats=recent,
+            recent_beats=self._format_recent(state),
             user_input=user_input,
         )
 
-        # TODO: enable prompt caching on DIRECTOR_SYSTEM once the prompt stabilizes.
         resp = self._client.messages.create(
             model=settings.director_model,
             max_tokens=1024,
-            system=DIRECTOR_SYSTEM,
+            system=build_system_prompt(state.genre),
+            tools=[EMIT_BEAT_TOOL],
+            tool_choice={"type": "tool", "name": "emit_beat"},
             messages=[{"role": "user", "content": user_msg}],
         )
-        text = "".join(block.text for block in resp.content if block.type == "text").strip()
-        return self._parse(text)
+
+        for block in resp.content:
+            if getattr(block, "type", None) == "tool_use" and block.name == "emit_beat":
+                try:
+                    return DirectorOutput.model_validate(block.input)
+                except ValidationError as e:
+                    log.error("emit_beat input failed validation: %s\n%s", e, block.input)
+                    raise
+
+        # No tool_use block — model misbehaved despite forced tool_choice.
+        log.error("Director returned no emit_beat tool_use: %s", resp.content)
+        raise RuntimeError("Director did not emit the expected tool call")
+
+    def summarize(self, state: WorldState) -> str:
+        """Produce a short prose synopsis of the story so far. Uses up to the last 20 beats."""
+        if self._client is None:
+            return self._stub_synopsis(state)
+
+        beats_text = self._format_for_synopsis(state.beats[-20:])
+        user_msg = SYNOPSIS_USER_TEMPLATE.format(
+            genre=state.genre,
+            prior_synopsis=state.synopsis or "(none)",
+            beats=beats_text,
+        )
+        resp = self._client.messages.create(
+            model=settings.director_model,
+            max_tokens=400,
+            system=SYNOPSIS_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
 
     @staticmethod
     def _format_recent(state: WorldState) -> str:
@@ -80,18 +121,13 @@ class Director:
         )
 
     @staticmethod
-    def _parse(text: str) -> DirectorOutput:
-        # Strip code fences if the model added them despite instructions.
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        try:
-            return DirectorOutput.model_validate(json.loads(text))
-        except Exception as e:
-            log.error("Director returned unparseable JSON: %s\n---\n%s", e, text)
-            raise
+    def _format_for_synopsis(beats: list[Beat]) -> str:
+        if not beats:
+            return "(no beats yet)"
+        return "\n".join(
+            f"[{b.index}] user said: {b.user_input}\n    scene: {b.scene_prompt}"
+            for b in beats
+        )
 
     @staticmethod
     def _stub(state: WorldState, user_input: str) -> DirectorOutput:
@@ -105,6 +141,13 @@ class Director:
             ),
             narration=f"(stub director — set ANTHROPIC_API_KEY to enable Claude.) Beat {idx}.",
             state_delta=StateDelta(),
+        )
+
+    @staticmethod
+    def _stub_synopsis(state: WorldState) -> str:
+        return (
+            f"A {state.genre or 'open'} story with {len(state.beats)} beats so far. "
+            f"(stub synopsis — set ANTHROPIC_API_KEY to enable Claude.)"
         )
 
 
@@ -146,3 +189,17 @@ def append_beat(state: WorldState, user_input: str, out: DirectorOutput, video_u
     )
     state.beats.append(beat)
     return beat
+
+
+def maybe_update_synopsis(director: Director, state: WorldState) -> bool:
+    """Refresh the rolling synopsis if enough new beats have piled up. Returns True if updated."""
+    new_beats = len(state.beats) - state.synopsis_through_beat
+    if new_beats < SYNOPSIS_EVERY:
+        return False
+    try:
+        state.synopsis = director.summarize(state)
+        state.synopsis_through_beat = len(state.beats)
+        return True
+    except Exception as e:
+        log.warning("synopsis update failed (continuing): %s", e)
+        return False
