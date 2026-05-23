@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 .env
 data/holodeck.db
+data/holodeck.db-wal
+data/holodeck.db-shm
 data/sessions/*
 data/cache/*
 !data/sessions/.gitkeep
