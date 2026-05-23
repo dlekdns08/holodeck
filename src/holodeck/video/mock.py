@@ -7,13 +7,17 @@ from typing import Optional
 
 from ..config import CACHE_DIR
 from .base import GeneratedClip
+from .frames import extract_last_frame
 
 
 class MockProvider:
-    """Returns a placeholder clip + writes the prompt to a sidecar JSON file.
+    """Returns the placeholder clip and exercises the full continuity pipeline.
 
-    Use this to verify the full loop runs without burning real API credits.
-    The /static endpoint serves the placeholder.
+    On each call we:
+      1. write a sidecar JSON capturing the prompt (useful for offline review)
+      2. extract the last frame of the placeholder clip so the next call gets a
+         real `last_frame_url` to feed into image-to-video conditioning
+    No API credits burned.
     """
 
     name = "mock"
@@ -26,7 +30,6 @@ class MockProvider:
         resolution: str,
         last_frame_url: Optional[str] = None,
     ) -> GeneratedClip:
-        # Simulate generation latency so the UI's loading state is exercised.
         await asyncio.sleep(0.6)
 
         h = hashlib.sha1(prompt.encode()).hexdigest()[:12]
@@ -43,8 +46,11 @@ class MockProvider:
             )
         )
 
+        video_url = "/static/placeholder.mp4"
+        next_last_frame = await extract_last_frame(video_url, key=f"mock_{h}")
+
         return GeneratedClip(
-            video_url="/static/placeholder.mp4",
-            last_frame_url=None,
+            video_url=video_url,
+            last_frame_url=next_last_frame,
             raw={"mock": True, "sidecar": str(sidecar)},
         )
