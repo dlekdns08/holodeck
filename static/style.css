@@ -107,6 +107,11 @@ details {
   font-size: 12px;
   color: var(--muted);
 }
+
+.scene-prompt pre {
+  white-space: pre-wrap;
+  max-height: 160px;
+}
 pre {
   background: #0e0e15;
   padding: 12px;
