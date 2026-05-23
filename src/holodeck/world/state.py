@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -21,7 +21,7 @@ class Beat(BaseModel):
     narration: str = ""
     video_url: Optional[str] = None
     last_frame_url: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class WorldState(BaseModel):
@@ -35,12 +35,16 @@ class WorldState(BaseModel):
     open_threads: list[str] = Field(default_factory=list)
     beats: list[Beat] = Field(default_factory=list)
 
+    synopsis: str = ""
+    synopsis_through_beat: int = 0
+
     def recent_beats(self, n: int = 4) -> list[Beat]:
         return self.beats[-n:]
 
     def summary(self) -> str:
         chars = ", ".join(f"{c.name} ({c.description})" for c in self.characters) or "—"
         threads = "; ".join(self.open_threads) or "—"
+        synopsis = self.synopsis or "(no synopsis yet — story is still short)"
         return (
             f"Genre: {self.genre}\n"
             f"Location: {self.location or '—'}\n"
@@ -48,5 +52,6 @@ class WorldState(BaseModel):
             f"Tone: {self.tone or '—'}\n"
             f"Characters: {chars}\n"
             f"Open threads: {threads}\n"
-            f"Beats so far: {len(self.beats)}"
+            f"Beats so far: {len(self.beats)}\n"
+            f"Story so far: {synopsis}"
         )
