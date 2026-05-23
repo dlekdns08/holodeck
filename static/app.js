@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 
 let sessionId = localStorage.getItem("holodeck.session") || null;
 let busy = false;
+let currentStream = null;
 
 async function api(path, opts = {}) {
   const r = await fetch(`/api${path}`, {
@@ -13,15 +14,25 @@ async function api(path, opts = {}) {
 }
 
 function setStatus(text) { $("status").textContent = text; }
-function setBusy(b) {
+
+function setBusy(b, stage) {
   busy = b;
-  $("loading").classList.toggle("hidden", !b);
+  const loading = $("loading");
+  loading.classList.toggle("hidden", !b);
+  if (b && stage) loading.textContent = stage;
   $("turnBtn").disabled = b || !sessionId;
 }
 
 function renderState(state) {
   $("state").textContent = JSON.stringify(state, null, 2);
   $("turnBtn").disabled = busy || !state;
+}
+
+function showNarrationEarly(narration, scenePrompt) {
+  // Narration arrives before the video. Show it immediately so the user has
+  // *something* to read during the 5–30s diffusion wait.
+  $("narration").textContent = narration || "";
+  $("scenePrompt").textContent = scenePrompt || "";
 }
 
 function playBeat(beat) {
@@ -32,10 +43,76 @@ function playBeat(beat) {
   $("narration").textContent = beat.narration || "";
 }
 
+function closeStream() {
+  if (currentStream) {
+    currentStream.close();
+    currentStream = null;
+  }
+}
+
+function runTurnStreaming(userInput) {
+  return new Promise((resolve, reject) => {
+    if (!sessionId || !userInput.trim()) return resolve();
+    closeStream();
+    setBusy(true, "asking the director…");
+
+    const url = `/api/turn/stream?session_id=${encodeURIComponent(sessionId)}`
+      + `&user_input=${encodeURIComponent(userInput)}`;
+    const es = new EventSource(url);
+    currentStream = es;
+
+    es.addEventListener("planning", () => setBusy(true, "asking the director…"));
+
+    es.addEventListener("narration", (ev) => {
+      const data = JSON.parse(ev.data);
+      showNarrationEarly(data.narration, data.scene_prompt);
+      renderState(data.state);
+      setBusy(true, "rendering the shot…");
+    });
+
+    es.addEventListener("generating", (ev) => {
+      const data = JSON.parse(ev.data);
+      setBusy(true, `rendering with ${data.provider}…`);
+    });
+
+    es.addEventListener("beat", (ev) => {
+      const data = JSON.parse(ev.data);
+      playBeat(data.beat);
+      renderState(data.state);
+      $("input").value = "";
+      if (data.synopsis_updated) setStatus("synopsis refreshed");
+    });
+
+    es.addEventListener("done", () => {
+      setBusy(false);
+      closeStream();
+      resolve();
+    });
+
+    es.addEventListener("error", (ev) => {
+      let msg = "stream error";
+      try { msg = JSON.parse(ev.data).message; } catch {}
+      setStatus(`error: ${msg}`);
+      setBusy(false);
+      closeStream();
+      reject(new Error(msg));
+    });
+
+    es.onerror = () => {
+      // Network-level EventSource error (separate from named "error" events).
+      if (es.readyState === EventSource.CLOSED) {
+        setBusy(false);
+        closeStream();
+        resolve();
+      }
+    };
+  });
+}
+
 async function newStory() {
   const genre = $("genre").value.trim() || "open";
   const opening = $("opening").value.trim() || "The story begins.";
-  setBusy(true);
+  setBusy(true, "creating session…");
   try {
     const state = await api("/session", {
       method: "POST",
@@ -45,29 +122,11 @@ async function newStory() {
     localStorage.setItem("holodeck.session", sessionId);
     setStatus(`session ${sessionId.slice(0, 8)} · ${state.genre}`);
     renderState(state);
-    // Kick the first beat automatically using the opening as user input.
-    await runTurn(opening);
-  } catch (e) {
-    setStatus(`error: ${e.message}`);
-  } finally {
     setBusy(false);
-  }
-}
-
-async function runTurn(userInput) {
-  if (!sessionId || !userInput.trim()) return;
-  setBusy(true);
-  try {
-    const { beat, state } = await api("/turn", {
-      method: "POST",
-      body: JSON.stringify({ session_id: sessionId, user_input: userInput }),
-    });
-    playBeat(beat);
-    renderState(state);
-    $("input").value = "";
+    // Kick the first beat automatically using the opening as user input.
+    await runTurnStreaming(opening);
   } catch (e) {
     setStatus(`error: ${e.message}`);
-  } finally {
     setBusy(false);
   }
 }
@@ -94,9 +153,9 @@ async function bootstrap() {
 }
 
 $("newBtn").addEventListener("click", newStory);
-$("turnBtn").addEventListener("click", () => runTurn($("input").value));
+$("turnBtn").addEventListener("click", () => runTurnStreaming($("input").value));
 $("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !busy) runTurn(e.target.value);
+  if (e.key === "Enter" && !busy) runTurnStreaming(e.target.value);
 });
 
 bootstrap();
