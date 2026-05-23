@@ -17,12 +17,17 @@ class SessionStore:
         self._init_schema()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init_schema(self) -> None:
         with self._conn() as c:
+            # WAL lets readers and writers proceed concurrently, which matters once
+            # the SSE turn endpoint is reading state mid-generation while another
+            # request might be writing.
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
