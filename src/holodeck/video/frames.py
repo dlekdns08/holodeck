@@ -31,10 +31,11 @@ def _have_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-async def _resolve_local_video(video_url: str) -> Optional[Path]:
+async def resolve_local_video(video_url: str) -> Optional[Path]:
     """Return a local path to the video, downloading if it's remote.
 
-    Returns None if we can't get one.
+    Returns None if we can't get one. Used both by the last-frame extractor
+    (here) and by the mp4 exporter (video.export).
     """
     if video_url.startswith("/static/"):
         # Served from the package's static/ directory.
@@ -77,7 +78,7 @@ async def extract_last_frame(video_url: str, key: str) -> Optional[str]:
         log.info("ffmpeg not on PATH — skipping last-frame extraction")
         return None
 
-    local = await _resolve_local_video(video_url)
+    local = await resolve_local_video(video_url)
     if local is None:
         return None
 

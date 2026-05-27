@@ -21,18 +21,19 @@ function setBusy(b, stage) {
   loading.classList.toggle("hidden", !b);
   if (b && stage) loading.textContent = stage;
   $("turnBtn").disabled = b || !sessionId;
+  $("exportBtn").disabled = b || !sessionId;
 }
 
 function renderState(state) {
   $("state").textContent = JSON.stringify(state, null, 2);
   $("turnBtn").disabled = busy || !state;
+  $("exportBtn").disabled = busy || !state || !state.beats || state.beats.length === 0;
 }
 
-function showNarrationEarly(narration, scenePrompt) {
-  // Narration arrives before the video. Show it immediately so the user has
-  // *something* to read during the 5–30s diffusion wait.
+function showNarrationEarly(narration, scenePrompt, hit) {
   $("narration").textContent = narration || "";
   $("scenePrompt").textContent = scenePrompt || "";
+  if (hit) setStatus("⚡ speculation hit — instant beat");
 }
 
 function playBeat(beat) {
@@ -47,6 +48,43 @@ function closeStream() {
   if (currentStream) {
     currentStream.close();
     currentStream = null;
+  }
+}
+
+async function refreshSessionPicker() {
+  try {
+    const rows = await api("/sessions");
+    const picker = $("sessionPicker");
+    picker.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = `↩ resume… (${rows.length})`;
+    picker.appendChild(placeholder);
+    for (const row of rows) {
+      const opt = document.createElement("option");
+      opt.value = row.session_id;
+      const ts = (row.updated_at || "").replace("T", " ").slice(0, 16);
+      opt.textContent = `${row.session_id.slice(0, 8)} · ${row.genre} · ${row.beats}b · ${ts}`;
+      if (row.session_id === sessionId) opt.selected = true;
+      picker.appendChild(opt);
+    }
+  } catch (e) {
+    /* picker is non-critical; ignore */
+  }
+}
+
+async function selectSession(id) {
+  if (!id || id === sessionId) return;
+  try {
+    const state = await api(`/session/${id}`);
+    sessionId = id;
+    localStorage.setItem("holodeck.session", id);
+    setStatus(`resumed ${id.slice(0, 8)} · ${state.genre}`);
+    renderState(state);
+    const last = state.beats[state.beats.length - 1];
+    if (last) playBeat(last);
+  } catch (e) {
+    setStatus(`error: ${e.message}`);
   }
 }
 
@@ -65,9 +103,9 @@ function runTurnStreaming(userInput) {
 
     es.addEventListener("narration", (ev) => {
       const data = JSON.parse(ev.data);
-      showNarrationEarly(data.narration, data.scene_prompt);
+      showNarrationEarly(data.narration, data.scene_prompt, data.speculation_hit);
       renderState(data.state);
-      setBusy(true, "rendering the shot…");
+      setBusy(true, data.speculation_hit ? "playing pre-rendered beat…" : "rendering the shot…");
     });
 
     es.addEventListener("generating", (ev) => {
@@ -86,6 +124,7 @@ function runTurnStreaming(userInput) {
     es.addEventListener("done", () => {
       setBusy(false);
       closeStream();
+      refreshSessionPicker();
       resolve();
     });
 
@@ -99,7 +138,6 @@ function runTurnStreaming(userInput) {
     });
 
     es.onerror = () => {
-      // Network-level EventSource error (separate from named "error" events).
       if (es.readyState === EventSource.CLOSED) {
         setBusy(false);
         closeStream();
@@ -123,7 +161,7 @@ async function newStory() {
     setStatus(`session ${sessionId.slice(0, 8)} · ${state.genre}`);
     renderState(state);
     setBusy(false);
-    // Kick the first beat automatically using the opening as user input.
+    refreshSessionPicker();
     await runTurnStreaming(opening);
   } catch (e) {
     setStatus(`error: ${e.message}`);
@@ -131,13 +169,21 @@ async function newStory() {
   }
 }
 
+function exportMp4() {
+  if (!sessionId) return;
+  // Triggers the browser's download flow against /api/session/{id}/export.
+  window.location.href = `/api/session/${sessionId}/export`;
+}
+
 async function bootstrap() {
   try {
     const h = await api("/health");
-    setStatus(`video: ${h.video_provider} · director: ${h.director_model}`);
+    setStatus(`video: ${h.video_provider} · director: ${h.director_model}`
+      + (h.speculative_pregen ? " · spec✓" : ""));
   } catch {
     setStatus("offline");
   }
+  refreshSessionPicker();
   if (sessionId) {
     try {
       const state = await api(`/session/${sessionId}`);
@@ -154,6 +200,8 @@ async function bootstrap() {
 
 $("newBtn").addEventListener("click", newStory);
 $("turnBtn").addEventListener("click", () => runTurnStreaming($("input").value));
+$("exportBtn").addEventListener("click", exportMp4);
+$("sessionPicker").addEventListener("change", (e) => selectSession(e.target.value));
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !busy) runTurnStreaming(e.target.value);
 });

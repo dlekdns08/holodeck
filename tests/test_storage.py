@@ -40,6 +40,21 @@ def test_list_sessions_returns_in_recency_order(tmp_path: Path):
     assert "old" in ids and "new" in ids
 
 
+def test_list_sessions_includes_genre_and_beat_count(tmp_path: Path):
+    from holodeck.world.state import Beat
+
+    store = SessionStore(db_path=tmp_path / "t.db")
+    state = WorldState(session_id="s1", genre="noir")
+    state.beats.append(Beat(index=1, user_input="a", scene_prompt="..."))
+    state.beats.append(Beat(index=2, user_input="b", scene_prompt="..."))
+    store.save(state)
+
+    rows = store.list_sessions()
+    assert rows[0]["session_id"] == "s1"
+    assert rows[0]["genre"] == "noir"
+    assert rows[0]["beats"] == 2
+
+
 def test_wal_mode_is_enabled(tmp_path: Path):
     import sqlite3
 

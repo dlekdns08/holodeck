@@ -9,6 +9,9 @@ from ..config import settings
 from ..world.state import Beat, Character, WorldState
 from .prompts import (
     EMIT_BEAT_TOOL,
+    PREDICT_INPUTS_SYSTEM,
+    PREDICT_INPUTS_TOOL,
+    PREDICT_INPUTS_USER_TEMPLATE,
     SYNOPSIS_SYSTEM,
     SYNOPSIS_USER_TEMPLATE,
     USER_TURN_TEMPLATE,
@@ -42,8 +45,11 @@ class DirectorOutput(BaseModel):
 class Director:
     """Wraps Claude to plan the next beat from world state + user input.
 
-    Uses Anthropic tool_use so the response is already a parsed object — no JSON
-    wrangling. Falls back to a deterministic stub when no API key is configured.
+    Uses Anthropic tool_use so the response is already a parsed object. Marks
+    the system prompt + tools block as cacheable so repeat turns in the same
+    session hit the prompt cache. Retries the tool call once if the input
+    fails our local schema validation. Falls back to a deterministic stub when
+    no API key is configured.
     """
 
     def __init__(self) -> None:
@@ -70,26 +76,47 @@ class Director:
             user_input=user_input,
         )
 
-        resp = self._client.messages.create(
-            model=settings.director_model,
-            max_tokens=1024,
-            system=build_system_prompt(state.genre),
-            tools=[EMIT_BEAT_TOOL],
-            tool_choice={"type": "tool", "name": "emit_beat"},
-            messages=[{"role": "user", "content": user_msg}],
-        )
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
+            resp = self._client.messages.create(
+                model=settings.director_model,
+                max_tokens=1024,
+                # System and tools are stable per-session — mark both cacheable so
+                # turns 2+ get a prompt-cache hit on the bulk of the input tokens.
+                system=[
+                    {
+                        "type": "text",
+                        "text": build_system_prompt(state.genre),
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[{**EMIT_BEAT_TOOL, "cache_control": {"type": "ephemeral"}}],
+                tool_choice={"type": "tool", "name": "emit_beat"},
+                messages=[{"role": "user", "content": user_msg}],
+            )
 
-        for block in resp.content:
-            if getattr(block, "type", None) == "tool_use" and block.name == "emit_beat":
-                try:
-                    return DirectorOutput.model_validate(block.input)
-                except ValidationError as e:
-                    log.error("emit_beat input failed validation: %s\n%s", e, block.input)
-                    raise
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use" and block.name == "emit_beat":
+                    try:
+                        return DirectorOutput.model_validate(block.input)
+                    except ValidationError as e:
+                        last_err = e
+                        if attempt == 0:
+                            log.warning("emit_beat input failed validation, retrying once: %s", e)
+                            break  # re-issue the request
+                        log.error("emit_beat input failed validation on retry: %s\n%s", e, block.input)
+                        raise
 
-        # No tool_use block — model misbehaved despite forced tool_choice.
-        log.error("Director returned no emit_beat tool_use: %s", resp.content)
-        raise RuntimeError("Director did not emit the expected tool call")
+            else:
+                # Loop fell through without finding a tool_use block.
+                if attempt == 0:
+                    log.warning("Director returned no emit_beat tool_use, retrying once")
+                    continue
+                log.error("Director returned no emit_beat tool_use on retry: %s", resp.content)
+                raise RuntimeError("Director did not emit the expected tool call")
+
+        # Defensive — only reachable if both attempts fell out without raising/returning.
+        raise RuntimeError(f"Director failed after retry: {last_err}")
 
     def summarize(self, state: WorldState) -> str:
         """Produce a short prose synopsis of the story so far. Uses up to the last 20 beats."""
@@ -109,6 +136,43 @@ class Director:
             messages=[{"role": "user", "content": user_msg}],
         )
         return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+
+    def candidate_inputs(self, state: WorldState, k: int) -> list[str]:
+        """Predict K plausible next user inputs for speculative pre-generation.
+
+        Returns an empty list if Claude isn't configured or the call fails — the
+        caller treats this as "no speculation this turn" and moves on.
+        """
+        if self._client is None or k <= 0:
+            return []
+
+        last_beat = state.beats[-1] if state.beats else None
+        last_beat_text = (
+            f"[{last_beat.index}] user: {last_beat.user_input}\n    scene: {last_beat.scene_prompt[:200]}…"
+            if last_beat
+            else "(no beats yet — opening turn)"
+        )
+        user_msg = PREDICT_INPUTS_USER_TEMPLATE.format(
+            world_summary=state.summary(),
+            last_beat=last_beat_text,
+            k=k,
+        )
+        try:
+            resp = self._client.messages.create(
+                model=settings.director_model,
+                max_tokens=400,
+                system=PREDICT_INPUTS_SYSTEM,
+                tools=[PREDICT_INPUTS_TOOL],
+                tool_choice={"type": "tool", "name": "predict_inputs"},
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use" and block.name == "predict_inputs":
+                    candidates = block.input.get("candidates") or []
+                    return [c.strip() for c in candidates if isinstance(c, str) and c.strip()][:k]
+        except Exception as e:
+            log.warning("candidate_inputs failed (continuing without speculation): %s", e)
+        return []
 
     @staticmethod
     def _format_recent(state: WorldState) -> str:

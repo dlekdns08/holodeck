@@ -5,25 +5,38 @@ import json
 import logging
 import uuid
 from functools import lru_cache
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Awaitable, Optional, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from ..agents.director import Director, apply_delta, append_beat, maybe_update_synopsis
+from ..agents.director import (
+    Director,
+    DirectorOutput,
+    apply_delta,
+    append_beat,
+    maybe_update_synopsis,
+)
 from ..config import settings
+from ..speculation import SpeculationStore, speculate
 from ..storage import SessionStore
 from ..video import VideoProvider, get_provider
+from ..video.base import GeneratedClip
+from ..video.export import export_session
 from ..world.state import Beat, WorldState
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+T = TypeVar("T")
 
-# Lazy singletons so provider stubs that raise in __init__ (missing API keys) don't
-# blow up module import. Each is built at first use.
+# Heartbeat for the SSE stream. Proxies (nginx/cloudflare) drop idle
+# connections at ~60s; the Runway provider can poll for longer than that.
+KEEPALIVE_INTERVAL_S = 10.0
+
+
 @lru_cache(maxsize=1)
 def get_director() -> Director:
     return Director()
@@ -39,8 +52,11 @@ def get_video() -> VideoProvider:
     return get_provider()
 
 
-# Per-session lock registry. Prevents two concurrent /turn calls for the same
-# session from racing on beat indices or last_frame state.
+@lru_cache(maxsize=1)
+def get_speculation_store() -> SpeculationStore:
+    return SpeculationStore()
+
+
 _session_locks: dict[str, asyncio.Lock] = {}
 _locks_guard = asyncio.Lock()
 
@@ -76,6 +92,7 @@ def health(video: VideoProvider = Depends(get_video)) -> dict:
         "ok": True,
         "video_provider": video.name,
         "director_model": settings.director_model if not director.using_stub else "stub",
+        "speculative_pregen": settings.speculative_pregen_enabled,
     }
 
 
@@ -103,11 +120,49 @@ def list_sessions(store: SessionStore = Depends(get_store)) -> list[dict]:
     return store.list_sessions()
 
 
+@router.get("/session/{session_id}/export")
+async def export_session_mp4(
+    session_id: str,
+    store: SessionStore = Depends(get_store),
+) -> FileResponse:
+    state = store.load(session_id)
+    if not state:
+        raise HTTPException(404, "session not found")
+    if not state.beats:
+        raise HTTPException(400, "session has no beats to export")
+    out = await export_session(state)
+    if out is None:
+        raise HTTPException(500, "export failed (see server logs)")
+    return FileResponse(
+        out,
+        media_type="video/mp4",
+        filename=f"holodeck-{session_id[:8]}.mp4",
+    )
+
+
+async def _await_with_keepalive(coro: Awaitable[T]) -> AsyncIterator:
+    """Yield SSE keepalive comments every KEEPALIVE_INTERVAL_S until coro is done.
+
+    The final yielded value is the coroutine's result, wrapped in a single-element
+    tuple so the caller can distinguish it from heartbeat bytes via isinstance.
+    Long awaits (Director call, video generation) wrap themselves in this so
+    proxies don't kill the SSE connection.
+    """
+    task = asyncio.create_task(coro)  # type: ignore[arg-type]
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=KEEPALIVE_INTERVAL_S)
+        if task in done:
+            yield (task.result(),)
+            return
+        yield b": keepalive\n\n"
+
+
 @router.post("/turn", response_model=TurnResponse)
 async def turn(
     req: TurnRequest,
     store: SessionStore = Depends(get_store),
     video: VideoProvider = Depends(get_video),
+    spec: SpeculationStore = Depends(get_speculation_store),
 ) -> TurnResponse:
     director = get_director()
     lock = await _session_lock(req.session_id)
@@ -116,26 +171,31 @@ async def turn(
         if not state:
             raise HTTPException(404, "session not found")
 
-        plan = director.plan(state, req.user_input)
+        hit = spec.lookup(req.session_id, len(state.beats), req.user_input)
+        if hit is not None:
+            plan, clip = hit
+            log.info("speculation HIT for session=%s", req.session_id)
+        else:
+            plan = director.plan(state, req.user_input)
+            last_frame: Optional[str] = state.beats[-1].last_frame_url if state.beats else None
+            clip = await video.generate(
+                plan.scene_prompt,
+                seconds=settings.clip_seconds,
+                resolution=settings.clip_resolution,
+                last_frame_url=last_frame,
+            )
+
         apply_delta(state, plan.state_delta)
-
-        last_frame: Optional[str] = state.beats[-1].last_frame_url if state.beats else None
-        clip = await video.generate(
-            plan.scene_prompt,
-            seconds=settings.clip_seconds,
-            resolution=settings.clip_resolution,
-            last_frame_url=last_frame,
-        )
-
         beat = append_beat(state, req.user_input, plan, clip.video_url)
         beat.last_frame_url = clip.last_frame_url
         maybe_update_synopsis(director, state)
         store.save(state)
+        spec.invalidate(req.session_id)
+        spec.schedule(req.session_id, speculate(spec, director, video, state))
         return TurnResponse(beat=beat, state=state)
 
 
 def _sse(event: str, data: dict) -> bytes:
-    """Encode a Server-Sent Event frame."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
 
@@ -145,18 +205,14 @@ async def turn_stream(
     user_input: str,
     store: SessionStore = Depends(get_store),
     video: VideoProvider = Depends(get_video),
+    spec: SpeculationStore = Depends(get_speculation_store),
 ) -> StreamingResponse:
     """SSE variant of /turn.
 
-    Streams events in this order so the UI can react incrementally:
-      planning      — director invoked
-      narration     — narration + scene_prompt + updated state available
-      generating    — handed off to the video provider
-      beat          — final beat with video_url ready to play
-      done          — terminal frame
-      error         — emitted on any failure; stream then closes
-    EventSource only does GET, so this endpoint is GET — note that user_input
-    rides on the query string.
+    Streams `planning → narration → generating → beat → done`. Emits SSE
+    comment heartbeats during long awaits so proxies don't kill the stream.
+    Hits the speculation cache if the user input matches a pre-rendered
+    candidate at the current beat count, in which case `generating` is skipped.
     """
     director = get_director()
 
@@ -171,35 +227,71 @@ async def turn_stream(
 
                 yield _sse("planning", {"session_id": session_id})
 
-                # Director call is sync — push it to a thread so we don't block
-                # the event loop (and so the SSE keepalive can flow).
-                plan = await asyncio.to_thread(director.plan, state, user_input)
-                apply_delta(state, plan.state_delta)
+                hit = spec.lookup(session_id, len(state.beats), user_input)
+                plan: DirectorOutput
+                clip: GeneratedClip
 
-                yield _sse(
-                    "narration",
-                    {
-                        "narration": plan.narration,
-                        "scene_prompt": plan.scene_prompt,
-                        "state": json.loads(state.model_dump_json()),
-                    },
-                )
+                if hit is not None:
+                    plan, clip = hit
+                    log.info("speculation HIT (stream) for session=%s", session_id)
+                    apply_delta(state, plan.state_delta)
+                    yield _sse(
+                        "narration",
+                        {
+                            "narration": plan.narration,
+                            "scene_prompt": plan.scene_prompt,
+                            "state": json.loads(state.model_dump_json()),
+                            "speculation_hit": True,
+                        },
+                    )
+                else:
+                    plan_result = None
+                    async for item in _await_with_keepalive(
+                        asyncio.to_thread(director.plan, state, user_input)
+                    ):
+                        if isinstance(item, tuple):
+                            plan_result = item[0]
+                        else:
+                            yield item
+                    assert plan_result is not None
+                    plan = plan_result
+                    apply_delta(state, plan.state_delta)
 
-                yield _sse("generating", {"provider": video.name})
+                    yield _sse(
+                        "narration",
+                        {
+                            "narration": plan.narration,
+                            "scene_prompt": plan.scene_prompt,
+                            "state": json.loads(state.model_dump_json()),
+                            "speculation_hit": False,
+                        },
+                    )
 
-                last_frame = state.beats[-1].last_frame_url if state.beats else None
-                clip = await video.generate(
-                    plan.scene_prompt,
-                    seconds=settings.clip_seconds,
-                    resolution=settings.clip_resolution,
-                    last_frame_url=last_frame,
-                )
+                    yield _sse("generating", {"provider": video.name})
+                    last_frame = state.beats[-1].last_frame_url if state.beats else None
+                    clip_result = None
+                    async for item in _await_with_keepalive(
+                        video.generate(
+                            plan.scene_prompt,
+                            seconds=settings.clip_seconds,
+                            resolution=settings.clip_resolution,
+                            last_frame_url=last_frame,
+                        )
+                    ):
+                        if isinstance(item, tuple):
+                            clip_result = item[0]
+                        else:
+                            yield item
+                    assert clip_result is not None
+                    clip = clip_result
 
                 beat = append_beat(state, user_input, plan, clip.video_url)
                 beat.last_frame_url = clip.last_frame_url
 
                 synopsis_updated = await asyncio.to_thread(maybe_update_synopsis, director, state)
                 store.save(state)
+                spec.invalidate(session_id)
+                spec.schedule(session_id, speculate(spec, director, video, state))
 
                 yield _sse(
                     "beat",

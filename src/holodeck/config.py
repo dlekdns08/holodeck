@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     clip_seconds: int = 5
     clip_resolution: str = "720p"
 
+    # Speculative pre-generation: after each turn, ask the Director for K likely
+    # next user inputs and render them in the background so a matching real input
+    # plays instantly. Off by default — real providers cost real money.
+    speculative_pregen_enabled: bool = False
+    speculative_pregen_k: int = 2
+
     database_url: str = f"sqlite:///{DATA_DIR / 'holodeck.db'}"
 
 

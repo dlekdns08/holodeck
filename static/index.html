@@ -9,6 +9,7 @@
 <body>
   <header>
     <h1>Holodeck</h1>
+    <select id="sessionPicker" class="picker" title="resume a previous session"></select>
     <span id="status" class="status">—</span>
   </header>
 
@@ -32,6 +33,7 @@
       <div class="row">
         <input id="input" placeholder="what happens next?" autocomplete="off" />
         <button id="turnBtn" disabled>Next beat</button>
+        <button id="exportBtn" disabled title="stitch all beats into a single mp4">Export</button>
       </div>
       <details>
         <summary>World state</summary>

@@ -61,8 +61,26 @@ class SessionStore:
         return WorldState.model_validate(json.loads(row["state_json"]))
 
     def list_sessions(self) -> list[dict]:
+        """Return sessions newest-first with enough metadata to render a picker.
+
+        Decodes state_json so genre + beat count come out without a second roundtrip.
+        """
         with self._conn() as c:
             rows = c.execute(
-                "SELECT session_id, updated_at FROM sessions ORDER BY updated_at DESC"
+                "SELECT session_id, state_json, updated_at FROM sessions ORDER BY updated_at DESC"
             ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            try:
+                state = json.loads(r["state_json"])
+            except (TypeError, ValueError):
+                state = {}
+            out.append(
+                {
+                    "session_id": r["session_id"],
+                    "genre": state.get("genre", "open"),
+                    "beats": len(state.get("beats", [])),
+                    "updated_at": r["updated_at"],
+                }
+            )
+        return out

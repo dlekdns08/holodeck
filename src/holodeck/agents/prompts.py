@@ -138,3 +138,39 @@ Beats:
 
 Produce the updated synopsis (2–3 sentences, plain prose).
 """
+
+
+PREDICT_INPUTS_SYSTEM = """\
+You are predicting what the user will type next in an interactive story. \
+Read the world state and the most recent beat, then call the `predict_inputs` \
+tool with K short, plausible next-user-inputs — each a single imperative \
+sentence under 100 characters, written the way a real user would type it. \
+Vary them: one obvious follow-through, the rest more divergent."""
+
+
+PREDICT_INPUTS_TOOL = {
+    "name": "predict_inputs",
+    "description": "Emit K likely-next user inputs for speculative pre-generation.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "K short imperative sentences, each how a user might type their next input.",
+            },
+        },
+        "required": ["candidates"],
+    },
+}
+
+
+PREDICT_INPUTS_USER_TEMPLATE = """\
+== WorldState ==
+{world_summary}
+
+== Last beat ==
+{last_beat}
+
+Call predict_inputs with exactly {k} candidates.
+"""
